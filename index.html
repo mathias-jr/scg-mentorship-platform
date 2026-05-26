@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1"/>
+<meta name="theme-color" content="#2d3280"/>
+<meta name="description" content="Safety Campaign Ghana — Mentorship Platform"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<title>SCG · Mentorship Platform</title>
+<link rel="manifest" href="manifest.json"/>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Nunito+Sans:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="css/app.css"/>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast" class="toast"></div>
+
+<script type="module">
+import{initializeApp}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import{getAuth,onAuthStateChanged,signInWithEmailAndPassword,createUserWithEmailAndPassword,signOut,updateProfile}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import{getFirestore,doc,getDoc,setDoc,collection,getDocs,query,where,onSnapshot,addDoc,updateDoc,deleteDoc,orderBy,serverTimestamp,Timestamp}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import{getStorage,ref as sRef,uploadBytes,getDownloadURL}from"https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+const app=initializeApp({apiKey:"AIzaSyDYuommjN2ggBg4Oks9gk_TDwWRPP0UFNc",authDomain:"sgc-checkin-2d966.firebaseapp.com",projectId:"sgc-checkin-2d966",storageBucket:"sgc-checkin-2d966.firebasestorage.app",messagingSenderId:"88375703988",appId:"1:88375703988:web:fe75ea62c465262fbbdae1"});
+const auth=getAuth(app),db=getFirestore(app),storage=getStorage(app);
+const $=id=>document.getElementById(id),$app=$('app');
+let curUser=null,curRole=null,curMemberDoc=null;
+
+/* ── HELPERS ── */
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const initials=n=>n?n.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2):'?';
+const fmtDate=d=>{if(!d)return'';const dt=d.seconds?new Date(d.seconds*1000):new Date(d);return dt.toLocaleString('en-GB',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});};
+const isClosed=a=>{if(a.forceClosed)return true;if(a.forceOpen)return false;return new Date()>new Date(a.deadline);};
+const tlHours=dl=>(new Date(dl)-new Date())/36e5;
+const tlStr=dl=>{const h=tlHours(dl);if(h<=0)return null;return h<24?Math.floor(h)+'h left':Math.floor(h/24)+'d left';};
+const isToday=ts=>{if(!ts?.seconds)return false;return new Date(ts.seconds*1000).toDateString()===new Date().toDateString();};
+const timeAgo=ts=>{if(!ts?.seconds)return'';const d=Date.now()/1000-ts.seconds;if(d<60)return'now';if(d<3600)return Math.floor(d/60)+'m';if(d<86400)return Math.floor(d/3600)+'h';return Math.floor(d/86400)+'d';};
+const typeLabel=t=>({file:'File upload',image:'Image',linkedin:'LinkedIn link',text:'Text response',engagement:'LinkedIn engagement'}[t]||t);
+const typeTags=types=>(types||[]).map(t=>`<span class="type-tag">${typeLabel(t)}</span>`).join('');
+
+let toastT;
+function toast(msg,type='success'){const el=$('toast');el.textContent=msg;el.className='toast toast-'+type;el.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>el.style.display='none',3000);}
+
+const LOGO_SVG=`<svg width="48" height="48" viewBox="0 0 100 100" fill="none"><circle cx="50" cy="56" r="21" stroke="#e8521a" stroke-width="7" fill="none"/><line x1="50" y1="35" x2="50" y2="27" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="50" y1="77" x2="50" y2="85" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="29" y1="56" x2="21" y2="56" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="71" y1="56" x2="79" y2="56" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="35" y1="41" x2="29" y2="35" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="65" y1="71" x2="71" y2="77" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="65" y1="41" x2="71" y2="35" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><line x1="35" y1="71" x2="29" y2="77" stroke="#e8521a" stroke-width="5" stroke-linecap="round"/><path d="M26 52 Q26 28 50 26 Q74 28 74 52" fill="#2d3280"/><rect x="23" y="50" width="54" height="9" rx="4.5" fill="#2d3280"/><path d="M30 50 Q50 43 70 50" stroke="rgba(255,255,255,0.3)" stroke-width="2" fill="none"/></svg>`;
+
+/* ── DATA CACHE ── */
+let _members=[],_assignments=[],_submissions=[];
+async function loadAll(){
+  const[ms,as,ss]=await Promise.all([getDocs(collection(db,'members')),getDocs(query(collection(db,'assignments'),orderBy('deadline','desc'))),getDocs(collection(db,'submissions'))]);
+  _members=ms.docs.map(d=>({id:d.id,...d.data()}));
+  _assignments=as.docs.map(d=>({id:d.id,...d.data()}));
+  _submissions=ss.docs.map(d=>({id:d.id,...d.data()}));
+}
+
+/* ── ROUTING ── */
+let _params={};
+function nav(page,params={},push=true){_params=params;if(push)history.pushState({page,params},'','#'+page);render(page);}
+window.addEventListener('popstate',e=>{const s=e.state;render(s?.page||getHash());_params=s?.params||{};});
+function getHash(){return location.hash.slice(1)||'login';}
+function render(page){
+  if(!curUser&&page!=='login'){nav('login');return;}
+  if(curUser&&page==='login'){nav(curRole==='admin'?'admin':'dash');return;}
+  if(page==='admin'&&curRole!=='admin'){nav('dash');return;}
+  const pages={login:pgLogin,dash:pgDash,assignment:pgAssignment,admin:pgAdmin,adminAssign:pgAdminAssign};
+  (pages[page]||pgLogin)();
+}
+
+/* ════════════════════════════════════════════════
+   LOGIN PAGE
+   ════════════════════════════════════════════════ */
+function pgLogin(){
+$app.innerHTML=`
+<div class="login-page">
+<div class="login-card">
+  <div class="login-brand">${LOGO_SVG}
+    <div class="login-brand-text">
+      <span class="login-brand-name">Safety Campaign <span class="accent">Ghana</span></span>
+      <span class="login-brand-sub">Mentorship Programme 2026</span>
+    </div>
+  </div>
+  <div class="login-tabs">
+    <button class="login-tab active" onclick="switchTab('si')">Sign in</button>
+    <button class="login-tab" onclick="switchTab('su')">First time?</button>
+  </div>
+  <div id="tab-si" class="login-tab-content active">
+    <div class="field"><label>Email</label><input type="email" id="si-email" placeholder="you@example.com"/></div>
+    <div class="field"><label>Password</label><input type="password" id="si-pass" placeholder="Your password"/></div>
+    <button class="btn-primary" id="si-btn" onclick="doSignIn()">Sign in</button>
+    <div class="login-error" id="si-err"></div>
+  </div>
+  <div id="tab-su" class="login-tab-content">
+    <p class="setup-hint">Enter the email your admin registered, then create a password.</p>
+    <div class="field"><label>Email</label><input type="email" id="su-email" placeholder="you@example.com"/></div>
+    <div class="field"><label>Create password</label><input type="password" id="su-pass" placeholder="Min 6 characters"/></div>
+    <div class="field"><label>Confirm password</label><input type="password" id="su-pass2" placeholder="Type again"/></div>
+    <button class="btn-primary" id="su-btn" onclick="doSetup()">Create account</button>
+    <div class="login-error" id="su-err"></div>
+  </div>
+</div>
+<div class="login-footer">Safety Campaign Ghana © 2026</div>
+</div>`;
+}
+
+window.switchTab=function(t){
+  document.querySelectorAll('.login-tab').forEach((b,i)=>b.classList.toggle('active',i===(t==='si'?0:1)));
+  $('tab-si').classList.toggle('active',t==='si');
+  $('tab-su').classList.toggle('active',t==='su');
+};
+
+window.doSignIn=async function(){
+  const email=$('si-email').value.trim(),pass=$('si-pass').value,err=$('si-err'),btn=$('si-btn');
+  err.textContent='';if(!email||!pass){err.textContent='Fill in both fields.';return;}
+  btn.disabled=true;btn.textContent='Signing in...';
+  try{await signInWithEmailAndPassword(auth,email,pass);}
+  catch(e){err.textContent=e.code==='auth/invalid-credential'?'Wrong email or password.':e.code==='auth/user-not-found'?'No account. Use First time? tab.':e.message;btn.disabled=false;btn.textContent='Sign in';}
+};
+
+window.doSetup=async function(){
+  const email=$('su-email').value.trim().toLowerCase(),pass=$('su-pass').value,pass2=$('su-pass2').value,err=$('su-err'),btn=$('su-btn');
+  err.textContent='';
+  if(!email||!pass||!pass2){err.textContent='Fill all fields.';return;}
+  if(pass.length<6){err.textContent='Password needs 6+ characters.';return;}
+  if(pass!==pass2){err.textContent='Passwords don\'t match.';return;}
+  btn.disabled=true;btn.textContent='Checking...';
+  try{
+    const snap=await getDocs(query(collection(db,'members'),where('email','==',email)));
+    if(snap.empty){err.textContent='Email not registered. Ask your admin.';btn.disabled=false;btn.textContent='Create account';return;}
+    const mDoc=snap.docs[0],mData=mDoc.data();
+    btn.textContent='Creating account...';
+    const cred=await createUserWithEmailAndPassword(auth,email,pass);
+    await updateProfile(cred.user,{displayName:mData.name});
+    await updateDoc(doc(db,'members',mDoc.id),{uid:cred.user.uid,activated:true});
+    toast('Welcome, '+mData.name+'! 🎉');
+  }catch(e){err.textContent=e.code==='auth/email-already-in-use'?'Account exists. Use Sign in.':e.message;btn.disabled=false;btn.textContent='Create account';}
+};
+
+/* ════════════════════════════════════════════════
+   MENTEE DASHBOARD
+   ════════════════════════════════════════════════ */
+function pgDash(){
+  const name=curUser.displayName||curUser.email;
+  $app.innerHTML=`
+  <div class="app-shell">
+    <header class="app-header"><div class="header-inner">
+      <div class="header-brand"><div class="avatar">${initials(name)}</div><div><div class="header-name">Hey, ${esc(name.split(' ')[0])}</div><div class="header-sub">Safety Campaign Ghana 2026</div></div></div>
+      <div class="header-actions"><button class="icon-btn" onclick="signOut(window._auth)">🚪</button></div>
+    </div></header>
+    <main class="main-content" id="mc"><div class="loading-state"><div class="spinner"></div></div></main>
+  </div>`;
+  window._auth=auth;
+  loadDash();
+}
+
+async function loadDash(){
+  const mc=$('mc');
+  try{
+    await loadAll();
+    const mySubs={};_submissions.filter(s=>s.uid===curUser.uid).forEach(s=>mySubs[s.assignmentId]=s);
+    const total=_assignments.length,done=_assignments.filter(a=>mySubs[a.id]).length;
+    const dueSoon=_assignments.filter(a=>!mySubs[a.id]&&!isClosed(a)&&tlHours(a.deadline)<=48&&tlHours(a.deadline)>0).length;
+    const reviewed=Object.values(mySubs).filter(s=>s.feedback).length;
+    const pct=total?Math.round(done/total*100):0;
+
+    mc.innerHTML=`
+    <div class="progress-banner">
+      <div class="progress-label">Your progress</div>
+      <div class="progress-stats">
+        <div class="pstat"><div class="pstat-val">${done}/${total}</div><div class="pstat-lbl">Submitted</div></div>
+        <div class="pstat"><div class="pstat-val">${reviewed}</div><div class="pstat-lbl">Reviewed</div></div>
+        <div class="pstat pstat-alert"><div class="pstat-val">${dueSoon}</div><div class="pstat-lbl">Due soon</div></div>
+      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+    </div>
+    <div class="section-title">Assignments</div>
+    ${total===0?'<div class="empty-state">No assignments yet.</div>':''}
+    ${_assignments.sort((a,b)=>new Date(a.deadline)-new Date(b.deadline)).map(a=>{
+      const sub=mySubs[a.id],closed=isClosed(a),dn=!!sub,fb=sub?.feedback,missed=closed&&!dn;
+      const urgent=!dn&&!closed&&tlHours(a.deadline)<=48&&tlHours(a.deadline)>0;
+      const tl=tlStr(a.deadline);
+      let st,sc;if(fb){st='Reviewed';sc='badge-green';}else if(dn){st='Submitted';sc='badge-blue';}else if(missed){st='Missed';sc='badge-red';}else if(closed){st='Closed';sc='badge-red';}else{st='Pending';sc='badge-amber';}
+      return`<div class="assign-card ${urgent?'assign-urgent':''} ${missed?'assign-missed':''}" onclick="nav('assignment',{id:'${a.id}'})">
+        ${urgent?'<div class="urgent-badge">Due soon</div>':''}
+        <div class="assign-header"><div class="assign-title">${esc(a.title)}</div><span class="badge ${sc}">${st}</span></div>
+        <div class="assign-due">${closed&&!dn?'Closed':'Due: '+fmtDate(a.deadline)}${tl&&!closed?' · <span class="'+(urgent?'text-orange':'text-muted')+'">'+tl+'</span>':''}</div>
+        <div class="assign-types">${typeTags(a.submissionTypes)}</div>
+        ${fb?'<div class="feedback-box"><div class="feedback-label">Admin feedback</div><div class="feedback-text">'+esc(fb)+'</div></div>':''}
+      </div>`;
+    }).join('')}`;
+  }catch(e){mc.innerHTML=`<div class="error-state">${esc(e.message)}</div>`;}
+}
+
+/* ════════════════════════════════════════════════
+   ASSIGNMENT DETAIL (mentee)
+   ════════════════════════════════════════════════ */
+function pgAssignment(){
+  const id=_params.id;if(!id){nav('dash');return;}
+  $app.innerHTML=`<div class="app-shell"><header class="app-header"><div class="header-inner"><button class="back-btn" onclick="nav('dash')">← Back</button><button class="icon-btn" onclick="signOut(window._auth)">🚪</button></div></header><main class="main-content" id="mc"><div class="loading-state"><div class="spinner"></div></div></main></div>`;
+  window._auth=auth;
+  loadAssignment(id);
+}
+
+let selectedFile=null;
+async function loadAssignment(id){
+  const mc=$('mc');
+  try{
+    await loadAll();
+    const a=_assignments.find(x=>x.id===id);if(!a){mc.innerHTML='<div class="error-state">Not found.</div>';return;}
+    const closed=isClosed(a),types=a.submissionTypes||['file'];
+    const sub=_submissions.find(s=>s.assignmentId===id&&s.uid===curUser.uid);
+    const dn=!!sub;
+    const isEngagement=types.includes('engagement');
+
+    let engagementHTML='';
+    if(isEngagement){
+      const allSubs=_submissions.filter(s=>s.assignmentId===id&&s.linkedinUrl);
+      const myEngSub=sub;
+      const hasPosted=!!myEngSub?.linkedinUrl;
+
+      if(!hasPosted&&!closed){
+        engagementHTML=`
+        <div class="engagement-gate">
+          <div class="section-title">Step 1 · Submit your post</div>
+          <div class="field"><label>Your LinkedIn post URL</label><input type="url" id="eng-url" placeholder="https://linkedin.com/posts/..."/></div>
+          <button class="btn-primary" onclick="submitEngagementPost('${id}')">Submit post</button>
+          <div class="login-error" id="eng-err"></div>
+          <div class="engagement-gate-lock" style="margin-top:10px;">🔒 Submit your post first to see others' posts</div>
+        </div>`;
+      } else if(hasPosted){
+        const otherSubs=allSubs.filter(s=>s.uid!==curUser.uid);
+        const myEng=myEngSub?.engagements||{};
+        const totalOthers=otherSubs.length;
+        const fullyDone=otherSubs.filter(s=>{const e=myEng[s.uid];return e?.liked&&e?.commented&&e?.reposted;}).length;
+
+        engagementHTML=`
+        <div class="done-banner"><span>✅</span><div><strong>Your post submitted</strong><div class="text-muted">${esc(myEngSub.linkedinUrl)}</div></div></div>
+        <div class="section-title">Step 2 · Engage with others (${fullyDone}/${totalOthers})</div>
+        <div class="engagement-list">
+        ${otherSubs.length===0?'<div class="empty-state">No other posts yet. Check back later.</div>':''}
+        ${otherSubs.map(s=>{
+          const e=myEng[s.uid]||{liked:false,commented:false,reposted:false};
+          const allDone=e.liked&&e.commented&&e.reposted;
+          const cnt=[e.liked,e.commented,e.reposted].filter(Boolean).length;
+          return`<div class="engage-card ${allDone?'engage-done':''}">
+            <div class="engage-header">
+              <div class="avatar avatar-sm">${initials(s.memberName)}</div>
+              <div style="flex:1"><div class="engage-name">${esc(s.memberName)}</div>
+              <a href="${esc(s.linkedinUrl)}" target="_blank" class="engage-link">${esc(s.linkedinUrl).substring(0,40)}... ↗</a></div>
+              <span class="badge ${allDone?'badge-green':'badge-amber'}">${allDone?'Done':cnt+'/3'}</span>
+            </div>
+            <div class="engage-actions">
+              ${['liked','commented','reposted'].map(act=>`
+              <div class="engage-check ${e[act]?'checked':''}" onclick="toggleEngage('${id}','${s.uid}','${act}',${!e[act]})">
+                <div class="engage-check-box">${e[act]?'✓':''}</div>
+                <span>${act.charAt(0).toUpperCase()+act.slice(1)}</span>
+              </div>`).join('')}
+            </div>
+          </div>`;
+        }).join('')}
+        </div>`;
+      } else {
+        engagementHTML=`<div class="missed-banner"><span>🔒</span><div>This engagement assignment is closed.</div></div>`;
+      }
+    }
+
+    mc.innerHTML=`
+    <div class="assign-detail-header">
+      <h1>${esc(a.title)}</h1>
+      <div class="assign-due-detail">${closed?'🔒 Closed':'📅 Due: '+fmtDate(a.deadline)}</div>
+      ${a.description?'<p class="assign-desc">'+esc(a.description)+'</p>':''}
+      <div class="assign-types">${typeTags(types)}</div>
+    </div>
+    ${sub?.feedback?'<div class="feedback-box" style="margin-bottom:16px"><div class="feedback-label">Admin feedback</div><div class="feedback-text">'+esc(sub.feedback)+'</div></div>':''}
+    ${isEngagement?engagementHTML:`
+    ${dn?`
+      <div class="done-banner"><span>✅</span><div><strong>Submitted</strong><div class="text-muted">${fmtDate(sub.submittedAt)}</div></div></div>
+      ${sub.fileName?'<div class="submission-preview"><span class="file-icon">📄</span><span class="file-name">'+esc(sub.fileName)+'</span></div>':''}
+      ${sub.linkedinUrl?'<div class="submission-preview"><span class="file-icon">🔗</span><span class="file-name">'+esc(sub.linkedinUrl)+'</span></div>':''}
+      ${sub.textResponse?'<div class="submission-preview" style="display:block"><div class="text-muted" style="font-size:11px">Your response:</div><div style="font-size:13px;line-height:1.6;margin-top:4px">'+esc(sub.textResponse).substring(0,500)+'</div></div>':''}
+    `:closed?'<div class="missed-banner"><span>🔒</span><div>This assignment is closed.</div></div>':`
+      <div id="submit-area">
+        ${types.includes('file')||types.includes('image')?`
+        <div class="field"><label>${types.includes('image')?'Upload file or image':'Upload file'}</label>
+          <div class="upload-zone" onclick="$('file-input').click()"><div class="upload-icon">📁</div><div class="upload-text">Tap to choose file</div><div class="upload-hint">PDF, DOCX, PPTX${types.includes('image')?', JPEG, PNG':''} — max 10 MB</div></div>
+          <input type="file" id="file-input" style="display:none" accept="${types.includes('image')?'.pdf,.docx,.pptx,.jpg,.jpeg,.png':'.pdf,.docx,.pptx'}" onchange="onFileSelect(this)"/>
+          <div id="file-preview"></div>
+        </div>`:''}
+        ${types.includes('linkedin')?'<div class="field"><label>LinkedIn post URL</label><input type="url" id="li-url" placeholder="https://linkedin.com/posts/..."/></div>':''}
+        ${types.includes('text')?'<div class="field"><label>Text response</label><textarea id="txt-resp" rows="5" placeholder="Write your response..."></textarea></div>':''}
+        <button class="btn-primary btn-submit" id="sub-btn" onclick="doSubmit('${id}')">Submit assignment</button>
+        <div class="login-error" id="sub-err"></div>
+      </div>`}
+    `}`;
+  }catch(e){mc.innerHTML=`<div class="error-state">${esc(e.message)}</div>`;}
+}
+
+window.onFileSelect=function(inp){
+  const f=inp.files[0];if(!f)return;
+  if(f.size>10*1024*1024){toast('File too large (max 10 MB).','error');return;}
+  selectedFile=f;
+  $('file-preview').innerHTML=`<div class="file-selected"><span class="file-icon">📄</span><span class="file-name">${esc(f.name)}</span><span class="file-size">${(f.size/1048576).toFixed(1)} MB</span><button class="file-remove" onclick="selectedFile=null;$('file-input').value='';$('file-preview').innerHTML='';">✕</button></div>`;
+};
+
+window.doSubmit=async function(aid){
+  const btn=$('sub-btn'),err=$('sub-err');err.textContent='';
+  const liUrl=$('li-url')?.value.trim()||'',txtResp=$('txt-resp')?.value.trim()||'';
+  if(!selectedFile&&!liUrl&&!txtResp){err.textContent='Submit at least one item.';return;}
+  if(liUrl&&!liUrl.includes('linkedin.com')){err.textContent='Enter a valid LinkedIn URL.';return;}
+  btn.disabled=true;btn.textContent='Submitting...';
+  try{
+    let fileUrl='',fileName='';
+    if(selectedFile){
+      const r=sRef(storage,`submissions/${curUser.uid}/${aid}/${selectedFile.name}`);
+      await uploadBytes(r,selectedFile);fileUrl=await getDownloadURL(r);fileName=selectedFile.name;
+    }
+    await addDoc(collection(db,'submissions'),{assignmentId:aid,uid:curUser.uid,memberName:curUser.displayName||curUser.email,memberEmail:curUser.email,fileUrl,fileName,linkedinUrl:liUrl,textResponse:txtResp,submittedAt:serverTimestamp(),feedback:'',reviewed:false,engagements:{}});
+    selectedFile=null;toast('Submitted! ✅');nav('dash');
+  }catch(e){err.textContent=e.message;btn.disabled=false;btn.textContent='Submit assignment';}
+};
+
+window.submitEngagementPost=async function(aid){
+  const url=$('eng-url')?.value.trim(),err=$('eng-err');
+  if(!url||!url.includes('linkedin.com')){err.textContent='Enter a valid LinkedIn URL.';return;}
+  try{
+    const existing=_submissions.find(s=>s.assignmentId===aid&&s.uid===curUser.uid);
+    if(existing){await updateDoc(doc(db,'submissions',existing.id),{linkedinUrl:url});}
+    else{await addDoc(collection(db,'submissions'),{assignmentId:aid,uid:curUser.uid,memberName:curUser.displayName||curUser.email,memberEmail:curUser.email,fileUrl:'',fileName:'',linkedinUrl:url,textResponse:'',submittedAt:serverTimestamp(),feedback:'',reviewed:false,engagements:{}});}
+    toast('Post submitted! Now engage with others.');
+    await loadAssignment(aid);
+  }catch(e){err.textContent=e.message;}
+};
+
+window.toggleEngage=async function(aid,targetUid,action,val){
+  try{
+    const mySub=_submissions.find(s=>s.assignmentId===aid&&s.uid===curUser.uid);
+    if(!mySub)return;
+    const eng=mySub.engagements||{};
+    if(!eng[targetUid])eng[targetUid]={liked:false,commented:false,reposted:false};
+    eng[targetUid][action]=val;
+    await updateDoc(doc(db,'submissions',mySub.id),{engagements:eng});
+    toast(val?action.charAt(0).toUpperCase()+action.slice(1)+' ✓':'Unchecked','info');
+    await loadAssignment(aid);
+  }catch(e){toast(e.message,'error');}
+};
+
+/* ════════════════════════════════════════════════
+   ADMIN DASHBOARD
+   ════════════════════════════════════════════════ */
+function pgAdmin(){
+  $app.innerHTML=`
+  <div class="app-shell admin-shell">
+    <header class="app-header admin-header-bar"><div class="header-inner">
+      <div class="header-brand"><div class="avatar avatar-admin">⚙</div><div><div class="header-name">Admin Panel</div><div class="header-sub">SCG Mentorship 2026</div></div></div>
+      <div class="header-actions"><button class="icon-btn" onclick="signOut(window._auth)">🚪</button></div>
+    </div></header>
+    <main class="main-content" id="mc"><div class="loading-state"><div class="spinner"></div></div></main>
+  </div>`;
+  window._auth=auth;
+  loadAdmin();
+}
+
+async function loadAdmin(){
+  const mc=$('mc');
+  try{
+    await loadAll();
+    const activeA=_assignments.filter(a=>!isClosed(a)).length;
+    const todayS=_submissions.filter(s=>isToday(s.submittedAt)).length;
+
+    mc.innerHTML=`
+    <div class="admin-stats">
+      <div class="stat-card"><div class="stat-val">${_members.length}</div><div class="stat-lbl">Mentees</div></div>
+      <div class="stat-card"><div class="stat-val">${activeA}</div><div class="stat-lbl">Active</div></div>
+      <div class="stat-card stat-accent"><div class="stat-val">${todayS}</div><div class="stat-lbl">Today</div></div>
+      <div class="stat-card"><div class="stat-val">${_submissions.length}</div><div class="stat-lbl">Total subs</div></div>
+    </div>
+    <div class="admin-tabs">
+      <button class="admin-tab active" onclick="aTab('assign',this)">Assignments</button>
+      <button class="admin-tab" onclick="aTab('members',this)">Members</button>
+      <button class="admin-tab" onclick="aTab('subs',this)">Submissions</button>
+    </div>
+    <div id="atab-assign" class="admin-tab-content active">${renderAdminAssignments()}</div>
+    <div id="atab-members" class="admin-tab-content">${renderAdminMembers()}</div>
+    <div id="atab-subs" class="admin-tab-content">${renderAdminSubs()}</div>`;
+  }catch(e){mc.innerHTML=`<div class="error-state">${esc(e.message)}</div>`;}
+}
+
+window.aTab=function(t,btn){
+  document.querySelectorAll('.admin-tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.admin-tab-content').forEach(c=>c.classList.remove('active'));
+  btn.classList.add('active');$('atab-'+t).classList.add('active');
+};
+
+function renderAdminAssignments(){
+  return`
+  <div class="admin-section-header"><h2>Assignments</h2><button class="btn-orange" onclick="showNewAssign()">+ New</button></div>
+  <div id="new-assign-form"></div>
+  ${_assignments.length===0?'<div class="empty-state">No assignments.</div>':''}
+  ${_assignments.map(a=>{
+    const subs=_submissions.filter(s=>s.assignmentId===a.id);
+    const pct=_members.length?Math.round(subs.length/_members.length*100):0;
+    const closed=isClosed(a);
+    return`<div class="admin-assign-card">
+      <div class="admin-assign-top">
+        <div style="flex:1"><div class="admin-assign-title">${esc(a.title)}</div>
+        <div class="admin-assign-meta">Due: ${fmtDate(a.deadline)} · ${subs.length}/${_members.length} (${pct}%)</div>
+        <div class="assign-types">${typeTags(a.submissionTypes)}</div></div>
+        <div class="admin-assign-actions">
+          <span class="badge ${closed?'badge-red':'badge-green'}">${closed?'Closed':'Open'}</span>
+          <button class="btn-sm" onclick="nav('adminAssign',{id:'${a.id}'})">View</button>
+          <button class="btn-sm ${closed?'btn-sm-green':'btn-sm-red'}" onclick="toggleClose('${a.id}',${closed})">${closed?'Reopen':'Close'}</button>
+          <button class="btn-sm btn-sm-red" onclick="delAssign('${a.id}')">Delete</button>
+        </div>
+      </div>
+      <div class="admin-progress-bar"><div class="admin-progress-fill" style="width:${pct}%"></div></div>
+    </div>`;
+  }).join('')}`;
+}
+
+function renderAdminMembers(){
+  return`
+  <div class="admin-section-header"><h2>Members</h2><button class="btn-orange" onclick="showAddMember()">+ Add</button></div>
+  <div id="add-member-form"></div>
+  <div id="bulk-form"></div>
+  <div style="margin-bottom:12px"><button class="btn-ghost" onclick="showBulkUpload()">📋 Bulk upload emails</button></div>
+  ${_members.map(m=>`
+  <div class="admin-member-row">
+    <div class="admin-member-info"><div class="avatar avatar-sm">${initials(m.name)}</div><div><div class="admin-member-name">${esc(m.name)}</div><div class="admin-member-email">${esc(m.email)}</div></div></div>
+    <div class="admin-member-status">
+      <span class="badge ${m.activated?'badge-green':'badge-amber'}">${m.activated?'Active':'Pending'}</span>
+      ${m.role==='admin'?'<span class="badge badge-purple">Admin</span>':''}
+      <button class="btn-sm btn-sm-red" onclick="delMember('${m.id}')">Remove</button>
+    </div>
+  </div>`).join('')}`;
+}
+
+function renderAdminSubs(){
+  const sorted=[..._submissions].sort((a,b)=>(b.submittedAt?.seconds||0)-(a.submittedAt?.seconds||0));
+  return`
+  <div class="admin-section-header"><h2>Recent submissions</h2></div>
+  ${sorted.length===0?'<div class="empty-state">No submissions.</div>':''}
+  ${sorted.slice(0,30).map(s=>{
+    const a=_assignments.find(x=>x.id===s.assignmentId);
+    return`<div class="admin-sub-card">
+      <div class="admin-sub-top"><div class="avatar avatar-sm">${initials(s.memberName)}</div>
+        <div class="admin-sub-info"><div class="admin-sub-name">${esc(s.memberName||s.memberEmail)}</div><div class="admin-sub-assign">${esc(a?.title||'?')}</div></div>
+        <div class="admin-sub-time">${timeAgo(s.submittedAt)}</div>
+      </div>
+      ${s.fileName?`<div class="submission-preview"><span class="file-icon">📄</span><span class="file-name">${esc(s.fileName)}</span><a href="${s.fileUrl}" target="_blank" class="btn-sm">Download</a></div>`:''}
+      ${s.linkedinUrl?`<div class="submission-preview"><span class="file-icon">🔗</span><a href="${esc(s.linkedinUrl)}" target="_blank" class="file-name link">${esc(s.linkedinUrl).substring(0,45)}</a></div>`:''}
+      ${s.textResponse?`<div class="submission-preview" style="display:block"><div class="text-muted" style="font-size:11px">Text response</div><div style="font-size:12px;line-height:1.5;margin-top:4px">${esc(s.textResponse).substring(0,200)}${s.textResponse.length>200?'...':''}</div></div>`:''}
+      <div class="admin-sub-feedback">
+        <input type="text" placeholder="Write feedback..." value="${esc(s.feedback||'')}" id="fb-${s.id}" class="feedback-input"/>
+        <button class="btn-sm" onclick="sendFb('${s.id}')">Send</button>
+      </div>
+    </div>`;
+  }).join('')}`;
+}
+
+/* Admin actions */
+window.showNewAssign=function(){
+  const el=$('new-assign-form');
+  if(el.innerHTML){el.innerHTML='';return;}
+  el.innerHTML=`<div class="admin-form-card">
+    <div class="field"><label>Title</label><input type="text" id="na-title" placeholder="Assignment title..."/></div>
+    <div class="field"><label>Description</label><textarea id="na-desc" rows="2" placeholder="Optional description..."></textarea></div>
+    <div class="field"><label>Deadline</label><input type="datetime-local" id="na-dl"/></div>
+    <div class="field"><label>Submission types</label>
+      <div class="checkbox-group">
+        <label class="check-label"><input type="checkbox" value="file" checked/> File upload</label>
+        <label class="check-label"><input type="checkbox" value="image"/> Image</label>
+        <label class="check-label"><input type="checkbox" value="linkedin"/> LinkedIn link</label>
+        <label class="check-label"><input type="checkbox" value="text"/> Text response</label>
+        <label class="check-label"><input type="checkbox" value="engagement"/> LinkedIn engagement</label>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px"><button class="btn-primary" style="width:auto;padding:10px 20px" onclick="createAssign()">Create</button><button class="btn-ghost" onclick="$('new-assign-form').innerHTML=''">Cancel</button></div>
+  </div>`;
+};
+
+window.createAssign=async function(){
+  const title=$('na-title').value.trim(),desc=$('na-desc').value.trim(),dl=$('na-dl').value;
+  const types=[...document.querySelectorAll('.checkbox-group input:checked')].map(c=>c.value);
+  if(!title||!dl){toast('Fill title and deadline.','error');return;}
+  if(!types.length){toast('Pick at least one type.','error');return;}
+  await addDoc(collection(db,'assignments'),{title,description:desc,deadline:new Date(dl).toISOString(),submissionTypes:types,forceClosed:false,forceOpen:false,createdAt:serverTimestamp()});
+  toast('Assignment created! ✅');loadAdmin();
+};
+
+window.delAssign=async function(id){if(!confirm('Delete this assignment?'))return;await deleteDoc(doc(db,'assignments',id));toast('Deleted.');loadAdmin();};
+
+window.toggleClose=async function(id,wasClosed){
+  const a=_assignments.find(x=>x.id===id);if(!a)return;
+  if(wasClosed){await updateDoc(doc(db,'assignments',id),{forceOpen:true,forceClosed:false});toast('Reopened ✅');}
+  else{await updateDoc(doc(db,'assignments',id),{forceClosed:true,forceOpen:false});toast('Closed 🔒');}
+  loadAdmin();
+};
+
+window.showAddMember=function(){
+  const el=$('add-member-form');
+  if(el.innerHTML){el.innerHTML='';return;}
+  el.innerHTML=`<div class="admin-form-card">
+    <div class="field"><label>Name</label><input type="text" id="am-name" placeholder="Full name"/></div>
+    <div class="field"><label>Email</label><input type="email" id="am-email" placeholder="email@example.com"/></div>
+    <div class="field"><label>Role</label><select id="am-role"><option value="mentee">Mentee</option><option value="admin">Admin</option></select></div>
+    <div style="display:flex;gap:8px"><button class="btn-primary" style="width:auto;padding:10px 20px" onclick="addMember()">Add</button><button class="btn-ghost" onclick="$('add-member-form').innerHTML=''">Cancel</button></div>
+  </div>`;
+};
+
+window.addMember=async function(){
+  const name=$('am-name').value.trim(),email=$('am-email').value.trim().toLowerCase(),role=$('am-role').value;
+  if(!name||!email){toast('Fill name and email.','error');return;}
+  const existing=await getDocs(query(collection(db,'members'),where('email','==',email)));
+  if(!existing.empty){toast('Email already registered.','error');return;}
+  await addDoc(collection(db,'members'),{name,email,role,activated:false,uid:'',createdAt:serverTimestamp()});
+  toast(name+' added! ✅');loadAdmin();
+};
+
+window.delMember=async function(id){if(!confirm('Remove this member?'))return;await deleteDoc(doc(db,'members',id));toast('Removed.');loadAdmin();};
+
+window.showBulkUpload=function(){
+  const el=$('bulk-form');
+  if(el.innerHTML){el.innerHTML='';return;}
+  el.innerHTML=`<div class="admin-form-card bulk-area">
+    <div class="field"><label>Paste emails (one per line, format: Name, email)</label>
+    <textarea id="bulk-text" rows="6" placeholder="Akosua Mensah, akosua@example.com&#10;Kofi Owusu, kofi@example.com"></textarea></div>
+    <button class="btn-primary" style="width:auto;padding:10px 20px" onclick="doBulk()">Upload all</button>
+  </div>`;
+};
+
+window.doBulk=async function(){
+  const text=$('bulk-text').value.trim();if(!text){toast('Paste some data.','error');return;}
+  const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);
+  let added=0;
+  for(const line of lines){
+    const parts=line.split(',').map(p=>p.trim());
+    if(parts.length<2)continue;
+    const[name,email]=parts;
+    const existing=await getDocs(query(collection(db,'members'),where('email','==',email.toLowerCase())));
+    if(!existing.empty)continue;
+    await addDoc(collection(db,'members'),{name,email:email.toLowerCase(),role:'mentee',activated:false,uid:'',createdAt:serverTimestamp()});
+    added++;
+  }
+  toast(added+' members added! ✅');loadAdmin();
+};
+
+window.sendFb=async function(sid){
+  const inp=$('fb-'+sid);if(!inp)return;
+  await updateDoc(doc(db,'submissions',sid),{feedback:inp.value.trim(),reviewed:true});
+  toast('Feedback sent! ✅');
+};
+
+/* ════════════════════════════════════════════════
+   ADMIN ASSIGNMENT DETAIL
+   ════════════════════════════════════════════════ */
+function pgAdminAssign(){
+  const id=_params.id;if(!id){nav('admin');return;}
+  $app.innerHTML=`<div class="app-shell admin-shell"><header class="app-header admin-header-bar"><div class="header-inner"><button class="back-btn" onclick="nav('admin')">← Back</button><button class="icon-btn" onclick="signOut(window._auth)">🚪</button></div></header><main class="main-content" id="mc"><div class="loading-state"><div class="spinner"></div></div></main></div>`;
+  window._auth=auth;
+  loadAdminAssign(id);
+}
+
+let _adFilter='all';
+async function loadAdminAssign(id){
+  const mc=$('mc');
+  try{
+    await loadAll();
+    const a=_assignments.find(x=>x.id===id);if(!a){mc.innerHTML='<div class="error-state">Not found.</div>';return;}
+    const subs=_submissions.filter(s=>s.assignmentId===id);
+    const subMap={};subs.forEach(s=>subMap[s.uid||s.memberEmail]=s);
+    const closed=isClosed(a);
+    const pct=_members.length?Math.round(subs.length/_members.length*100):0;
+    const isEng=(a.submissionTypes||[]).includes('engagement');
+
+    const reviewed=subs.filter(s=>s.reviewed).length;
+    const pending=_members.filter(m=>!subMap[m.uid]&&!subMap[m.email]).length;
+
+    let filtered=_members;
+    if(_adFilter==='submitted')filtered=_members.filter(m=>subMap[m.uid]||subMap[m.email]);
+    if(_adFilter==='pending')filtered=_members.filter(m=>!subMap[m.uid]&&!subMap[m.email]);
+    if(_adFilter==='reviewed')filtered=_members.filter(m=>{const s=subMap[m.uid]||subMap[m.email];return s?.reviewed;});
+
+    mc.innerHTML=`
+    <div class="assign-detail-header">
+      <h1>${esc(a.title)}</h1>
+      <div class="assign-due-detail">${closed?'🔒 Closed':'📅 Due: '+fmtDate(a.deadline)}</div>
+      <div class="assign-types">${typeTags(a.submissionTypes)}</div>
+    </div>
+    <div class="detail-progress">
+      <div style="display:flex;justify-content:space-between;font-size:13px;font-weight:700"><span>${subs.length} of ${_members.length} submitted</span><span style="color:var(--orange)">${pct}%</span></div>
+      <div class="detail-bar"><div class="detail-fill" style="width:${pct}%"></div></div>
+      <div class="detail-counts">
+        <span style="color:var(--green)">✓ ${subs.length} submitted</span>
+        <span style="color:var(--amber)">⏳ ${pending} pending</span>
+        <span style="color:var(--purple)">💬 ${reviewed} reviewed</span>
+      </div>
+    </div>
+
+    ${isEng?renderEngMatrix(a,subs):''}
+
+    <div class="filter-tabs">
+      ${['all','submitted','pending','reviewed'].map(f=>`<button class="filter-tab ${_adFilter===f?'active':''}" onclick="_adFilter='${f}';loadAdminAssign('${id}')">${f.charAt(0).toUpperCase()+f.slice(1)} (${f==='all'?_members.length:f==='submitted'?subs.length:f==='pending'?pending:reviewed})</button>`).join('')}
+    </div>
+
+    ${filtered.map(m=>{
+      const s=subMap[m.uid]||subMap[m.email];
+      const hasSub=!!s;
+      return`<div class="mentee-sub-card ${s?.reviewed?'has-review':''} ${!hasSub?'is-pending':''}">
+        <div class="mentee-sub-header">
+          <div class="avatar avatar-sm">${initials(m.name)}</div>
+          <div style="flex:1"><div style="font-size:13px;font-weight:800">${esc(m.name)}</div>
+          <div style="font-size:11px;color:var(--muted)">${hasSub?'Submitted '+timeAgo(s.submittedAt)+' ago':'No submission yet'}</div></div>
+          <span class="badge ${s?.reviewed?'badge-green':hasSub?'badge-blue':'badge-amber'}">${s?.reviewed?'Reviewed':hasSub?'Submitted':'Pending'}</span>
+        </div>
+        ${hasSub?`<div class="mentee-sub-details">
+          ${s.fileName?`<div class="submission-preview"><span class="file-icon">📄</span><span class="file-name">${esc(s.fileName)}</span><a href="${s.fileUrl}" target="_blank" class="btn-sm">Download</a></div>`:''}
+          ${s.linkedinUrl?`<div class="submission-preview"><span class="file-icon">🔗</span><a href="${esc(s.linkedinUrl)}" target="_blank" class="file-name link">${esc(s.linkedinUrl).substring(0,40)}</a></div>`:''}
+          ${s.textResponse?`<div class="submission-preview" style="display:block"><div class="text-muted" style="font-size:11px">Text response</div><div style="font-size:12px;line-height:1.5;margin-top:4px">${esc(s.textResponse).substring(0,300)}</div></div>`:''}
+          ${s.feedback?'<div class="feedback-box"><div class="feedback-label">Your feedback</div><div class="feedback-text">'+esc(s.feedback)+'</div></div>':''}
+          <div class="admin-sub-feedback"><input type="text" placeholder="Write feedback..." value="${esc(s.feedback||'')}" id="fb-${s.id}" class="feedback-input"/><button class="btn-sm" onclick="sendFb('${s.id}')">Send</button></div>
+        </div>`:'<button class="nudge-btn">🔔 Send reminder</button>'}
+      </div>`;
+    }).join('')}
+
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-ghost" onclick="exportReport('${id}')">📥 Export report</button>
+      <button class="btn-sm ${closed?'btn-sm-green':'btn-sm-red'}" onclick="toggleClose('${id}',${closed});setTimeout(()=>loadAdminAssign('${id}'),500)">${closed?'🔓 Reopen':'🔒 Close now'}</button>
+    </div>`;
+  }catch(e){mc.innerHTML=`<div class="error-state">${esc(e.message)}</div>`;}
+}
+
+function renderEngMatrix(a,subs){
+  const submitters=subs.filter(s=>s.linkedinUrl);
+  if(!submitters.length)return'';
+  return`
+  <div style="margin-bottom:16px">
+    <div class="section-title">Engagement matrix</div>
+    <div class="matrix-wrap"><table class="matrix-table">
+      <tr><th></th>${submitters.map(s=>`<th style="writing-mode:vertical-lr;transform:rotate(180deg);height:50px;font-size:9px">${esc(s.memberName?.split(' ')[0]||'?')}</th>`).join('')}<th>Score</th></tr>
+      ${submitters.map(row=>{
+        const eng=row.engagements||{};
+        let totalPossible=0,totalDone=0;
+        const cells=submitters.map(col=>{
+          if(col.uid===row.uid)return'<td><div class="matrix-cell mc-self">—</div></td>';
+          totalPossible+=3;
+          const e=eng[col.uid]||{};
+          const cnt=[e.liked,e.commented,e.reposted].filter(Boolean).length;
+          totalDone+=cnt;
+          const cls=cnt===3?'mc-green':cnt>0?'mc-amber':'mc-red';
+          return`<td><div class="matrix-cell ${cls}">${cnt}/3</div></td>`;
+        }).join('');
+        const score=totalPossible?Math.round(totalDone/totalPossible*100):0;
+        return`<tr><td style="text-align:left;font-weight:700;font-size:11px;white-space:nowrap">${esc(row.memberName?.split(' ')[0]||'?')}</td>${cells}<td style="font-weight:800;font-size:11px;color:${score>=80?'var(--green)':score>=40?'var(--amber)':'var(--red)'}">${score}%</td></tr>`;
+      }).join('')}
+    </table></div>
+  </div>`;
+}
+
+window.exportReport=function(aid){
+  const a=_assignments.find(x=>x.id===aid);if(!a)return;
+  const subs=_submissions.filter(s=>s.assignmentId===aid);
+  const done=subs.map(s=>s.memberName||s.memberEmail);
+  const missing=_members.filter(m=>!done.includes(m.name)).map(m=>m.name);
+  const pct=_members.length?Math.round(done.length/_members.length*100):0;
+  const txt=`SAFETY CAMPAIGN GHANA — MENTORSHIP 2026\nAssignment Report: ${a.title}\nDeadline: ${fmtDate(a.deadline)}\nStatus: ${isClosed(a)?'CLOSED':'OPEN'}\nProgress: ${done.length}/${_members.length} (${pct}%)\n\n✅ Submitted (${done.length}):\n${done.map(n=>'  • '+n).join('\n')||'  (none)'}\n\n❌ Missing (${missing.length}):\n${missing.map(n=>'  • '+n).join('\n')||'  (all submitted)'}`;
+  const blob=new Blob([txt],{type:'text/plain'});
+  const url=URL.createObjectURL(blob);
+  const link=document.createElement('a');link.href=url;link.download=`SCG_${a.title.replace(/\s+/g,'_')}_Report.txt`;link.click();
+  URL.revokeObjectURL(url);toast('Report downloaded!');
+};
+
+/* ── AUTH ── */
+onAuthStateChanged(auth,async user=>{
+  if(user){
+    curUser=user;
+    const snap=await getDocs(query(collection(db,'members'),where('email','==',user.email)));
+    curRole=snap.empty?'mentee':(snap.docs[0].data().role||'mentee');
+    curMemberDoc=snap.empty?null:snap.docs[0];
+    const page=getHash();
+    if(page==='login')nav(curRole==='admin'?'admin':'dash');
+    else render(page);
+  }else{curUser=null;curRole=null;nav('login');}
+});
+
+/* Expose nav globally */
+window.nav=nav;window.$=$;
+
+/* Register Service Worker */
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/sw.js').catch(()=>{});
+}
+</script>
+</body>
+</html>
